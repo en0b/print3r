@@ -5,8 +5,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import threading
 
-WIDTH_PIXELS = 384
-CHUNK_LINES = 20
+WIDTH_PIXELS = 384 #Total width available with the thermal printer
+CHUNK_LINES = 20 #When printing, the images are split into chunks.
+                 #This is because otherwise random character printing can occur.
 
 globalSourceImage = 0
 globalDisplayImage = 0
@@ -39,6 +40,7 @@ def image_slicer_and_scaler(img):
         output.append(working_slice)
         count +=1
     return output
+
 def repaintImages():
     global lbl_image_orig
     global lbl_image_disp 
@@ -100,7 +102,9 @@ def printThreadFcn(evt):
                 #14 characters per line (double width)
                 for slice in slices:
                     printer.image(slice)
-                    time.sleep(0.5*countBlack(slice)/(384*20))
+                    ratio = countBlack(slice)/(384*20)
+                    ratio = 1.3 * max(0, ratio - 0.5)
+                    time.sleep(ratio)
                 printer.feed(2)
             evt.clear()
 
