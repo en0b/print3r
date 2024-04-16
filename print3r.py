@@ -22,7 +22,7 @@ def image_slicer_and_scaler(img):
     width, height = img.size
     upper = 0
     left = 0
-    slices = (1 + round(img.height / CHUNK_LINES))
+    slices = (0 + round(img.height / CHUNK_LINES))
 
     count = 1
     output = []
@@ -34,6 +34,10 @@ def image_slicer_and_scaler(img):
             lower = int(count * CHUNK_LINES)  
 
         bbox = (left, upper, width, lower)
+        print(left)
+        print(upper)
+        print(width)
+        print(lower)
         working_slice = img.crop(bbox)
         upper += CHUNK_LINES
         #save the slice
