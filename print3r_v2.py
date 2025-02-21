@@ -5,15 +5,12 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageEnhance, ImageTk, ImageGrab
 from thermalprinter import ThermalPrinter
 import serial.tools.list_ports
-import tempfile
-import os
 
 # Use the new resampling filter for Pillow (compatible with Pillow 10+)
 RESAMPLE_FILTER = getattr(Image, 'Resampling', Image).LANCZOS
 
 # Constants
-WIDTH_PIXELS = 384        # Thermal printer width
-CHUNK_LINES = 20          # Height of each chunk for printing
+WIDTH_PIXELS = 384  # Thermal printer width
 
 class ThermalPrintTool:
     def __init__(self):
@@ -221,6 +218,9 @@ class ThermalPrintTool:
         new_size = (WIDTH_PIXELS, round(self.source_image.height * factor))
         self.source_image = self.source_image.resize(new_size, RESAMPLE_FILTER)
         self.display_image = self.source_image
+        # Ensure the image has a filename attribute for logging in ThermalPrinter.image()
+        if not hasattr(self.display_image, 'filename'):
+            self.display_image.filename = "processed.bmp"
 
     def repaint_images(self):
         """Applies brightness/contrast adjustments and updates the image displays."""
@@ -230,6 +230,9 @@ class ThermalPrintTool:
         adjusted = ImageEnhance.Brightness(adjusted).enhance(1 + self.brightness)
         adjusted = ImageEnhance.Contrast(adjusted).enhance(1 + self.contrast)
         self.display_image = adjusted.convert('1')
+        # Ensure the image has a filename attribute for logging
+        if not hasattr(self.display_image, 'filename'):
+            self.display_image.filename = "processed.bmp"
         
         tmp_orig = ImageTk.PhotoImage(self.source_image)
         self.lbl_image_orig.config(image=tmp_orig)
@@ -260,20 +263,6 @@ class ThermalPrintTool:
             self.process_image()
             self.repaint_images()
 
-    def slice_and_scale_image(self, img):
-        """Slices the given image into chunks of height CHUNK_LINES."""
-        width, height = img.size
-        slices = []
-        for upper in range(0, height, CHUNK_LINES):
-            lower = min(upper + CHUNK_LINES, height)
-            slice_img = img.crop((0, upper, width, lower))
-            slices.append(slice_img)
-        return slices
-
-    def count_black(self, image):
-        """Counts black pixels in the image."""
-        return sum(1 for pixel in image.getdata() if pixel < 0.0001)
-
     def print_thread_function(self, event):
         """Handles printing in a separate thread."""
         while True:
@@ -282,29 +271,13 @@ class ThermalPrintTool:
                     print("Printer not connected.")
                     event.clear()
                     continue
-                slices = self.slice_and_scale_image(self.display_image)
                 try:
                     with ThermalPrinter(port=self.printer_port, heat_time=110) as printer:
-                        for slice_img in slices:
-                            if self.print_cancel_flag:
-                                print("Print canceled.")
-                                event.clear()
-                                self.print_cancel_flag = False
-                                printer.feed(2)
-                                break
-                            # Save slice as a temporary BMP file and print using its filename.
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".bmp") as tmp_file:
-                                temp_name = tmp_file.name
-                            slice_img.save(temp_name, format="BMP")
-                            printer.image(temp_name)
-                            os.remove(temp_name)
-                            
-                            ratio = self.count_black(slice_img) / (384 * 20)
-                            ratio = 1.3 * max(0, ratio - 0.5)
-                            time.sleep(ratio)
-                        else:
-                            # Feed extra paper (~1cm) out at the end of printing
-                            printer.feed(40)
+                        # Print the processed image using the built-in image() method.
+                        printer.image(self.display_image)
+                        # Simulate feeding extra paper by printing 10 empty lines.
+                        for _ in range(3):
+                            printer.out("")
                 except Exception as e:
                     print(f"Printing error: {e}")
                 event.clear()
