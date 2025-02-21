@@ -1,238 +1,326 @@
 import time
-from PIL import Image, ImageEnhance, ImageTk, ImageGrab
-from thermalprinter import *
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import threading
+from PIL import Image, ImageEnhance, ImageTk, ImageGrab
+from thermalprinter import ThermalPrinter
+import serial.tools.list_ports
+import tempfile
+import os
 
-WIDTH_PIXELS = 384  # Total width available with the thermal printer
-CHUNK_LINES = 20  # When printing, the images are split into chunks.
-MIN_WINDOW_WIDTH = 400
+# Use the new resampling filter for Pillow (compatible with Pillow 10+)
+RESAMPLE_FILTER = getattr(Image, 'Resampling', Image).LANCZOS
 
-globalSourceImage = None
-globalDisplayImage = None
-lbl_image_orig = None
-lbl_image_disp = None
-contrast = 0
-brightness = 0
-printerThread = None
-print_cancel_flag = False  # This is the new flag for canceling the print operation.
+# Constants
+WIDTH_PIXELS = 384        # Thermal printer width
+CHUNK_LINES = 20          # Height of each chunk for printing
 
-# New function to handle images from the clipboard
-def handle_clipboard_image():
-    global globalSourceImage, globalDisplayImage
-    try:
-        img = ImageGrab.grabclipboard()
-        if img is None:
-            messagebox.showerror("Error", "No image in clipboard")
-            return
-        globalSourceImage = img
-        process_image()
-        repaintImages()
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to process clipboard image: {e}")
+class ThermalPrintTool:
+    def __init__(self):
+        # Image and adjustment state
+        self.source_image = None
+        self.display_image = None
+        self.contrast = 0.0
+        self.brightness = 0.0
+        self.print_cancel_flag = False
+        self.printer_port = None
 
-def process_image():
-    global globalSourceImage, globalDisplayImage
-    if globalSourceImage.width > WIDTH_PIXELS:
-        factor = WIDTH_PIXELS / globalSourceImage.width
-        globalSourceImage = globalSourceImage.resize([round(globalSourceImage.width * factor), round(globalSourceImage.height * factor)], Image.ANTIALIAS)
-    globalDisplayImage = globalSourceImage
+        # Set up main window with a new dark color scheme
+        self.window = tk.Tk()
+        self.window.title("Thermal Print3r Tool")
+        self.window.iconbitmap('icon.ico')
+        self.window.configure(background="#2C3E50")  # Deep blue background
 
+        # Top frame: Printer status and refresh button
+        self.top_frame = tk.Frame(self.window, bg="#2C3E50")
+        self.top_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        self.lbl_printer_status = tk.Label(
+            self.top_frame,
+            text="Printer: Detecting...",
+            fg="#ECF0F1",  # light text
+            bg="#2C3E50",
+            font=("Arial", 12)
+        )
+        self.lbl_printer_status.pack(side=tk.LEFT)
+        btn_refresh = tk.Button(
+            self.top_frame,
+            text="Refresh Printer",
+            command=self.refresh_printer,
+            bg="#1ABC9C",  # Teal button
+            fg="#FFFFFF",
+            font=("Arial", 10)
+        )
+        btn_refresh.pack(side=tk.RIGHT)
 
-def image_slicer_and_scaler(img):
-    """slice an image into parts slice_size tall"""
-    width, height = img.size
-    upper = 0
-    left = 0
-    slices = (0 + round(img.height / CHUNK_LINES))
+        # Left frame: Controls for file operations, printing, and adjustments
+        self.left_frame = tk.Frame(self.window, bg="#34495E", relief=tk.RIDGE, borderwidth=2)
+        self.left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=5)
+        
+        btn_open = tk.Button(
+            self.left_frame,
+            text="Open Image",
+            command=self.open_image,
+            bg="#1ABC9C",
+            fg="#FFFFFF",
+            font=("Arial", 10)
+        )
+        btn_open.pack(pady=5, fill=tk.X)
+        
+        btn_print = tk.Button(
+            self.left_frame,
+            text="Print",
+            command=self.print_image,
+            bg="#1ABC9C",
+            fg="#FFFFFF",
+            font=("Arial", 10)
+        )
+        btn_print.pack(pady=5, fill=tk.X)
+        
+        btn_cancel = tk.Button(
+            self.left_frame,
+            text="Cancel Print",
+            command=self.cancel_print,
+            bg="#1ABC9C",
+            fg="#FFFFFF",
+            font=("Arial", 10)
+        )
+        btn_cancel.pack(pady=5, fill=tk.X)
+        
+        btn_rotate = tk.Button(
+            self.left_frame,
+            text="Rotate Image",
+            command=self.rotate_image,
+            bg="#1ABC9C",
+            fg="#FFFFFF",
+            font=("Arial", 10)
+        )
+        btn_rotate.pack(pady=5, fill=tk.X)
+        
+        separator = tk.Frame(self.left_frame, height=2, bd=1, relief=tk.SUNKEN, bg="#ECF0F1")
+        separator.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Brightness slider
+        lbl_brightness = tk.Label(
+            self.left_frame,
+            text="Brightness",
+            fg="#ECF0F1",
+            bg="#34495E",
+            font=("Arial", 10)
+        )
+        lbl_brightness.pack(pady=(5, 0))
+        self.scale_brightness = tk.Scale(
+            self.left_frame,
+            from_=-1.0,
+            to=1.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            length=150,
+            bg="#34495E",
+            fg="#ECF0F1",
+            command=self.on_brightness_change
+        )
+        self.scale_brightness.set(0.0)
+        self.scale_brightness.pack(pady=5)
+        
+        # Contrast slider
+        lbl_contrast = tk.Label(
+            self.left_frame,
+            text="Contrast",
+            fg="#ECF0F1",
+            bg="#34495E",
+            font=("Arial", 10)
+        )
+        lbl_contrast.pack(pady=(5, 0))
+        self.scale_contrast = tk.Scale(
+            self.left_frame,
+            from_=-1.0,
+            to=1.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            length=150,
+            bg="#34495E",
+            fg="#ECF0F1",
+            command=self.on_contrast_change
+        )
+        self.scale_contrast.set(0.0)
+        self.scale_contrast.pack(pady=5)
 
-    count = 1
-    output = []
-    for slice in range(slices):
-        #if we are at the end, set the lower bound to be the bottom of the image
-        if count == slices:
-            lower = height
+        # Right frame: Image display (original and processed)
+        self.right_frame = tk.Frame(self.window, bg="#34495E", relief=tk.RIDGE, borderwidth=2)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        self.lbl_image_orig = tk.Label(self.right_frame, text="Original Image", bg="#34495E", fg="#ECF0F1")
+        self.lbl_image_orig.grid(row=0, column=0, padx=5, pady=5)
+        self.lbl_image_disp = tk.Label(self.right_frame, text="Processed Image", bg="#34495E", fg="#ECF0F1")
+        self.lbl_image_disp.grid(row=0, column=1, padx=5, pady=5)
+        
+        # Bind Ctrl+V to paste image from clipboard
+        self.window.bind("<Control-v>", lambda event: self.handle_clipboard_image())
+        
+        # Start printer thread for printing jobs
+        self.print_event = threading.Event()
+        self.printer_thread = threading.Thread(
+            target=self.print_thread_function,
+            args=(self.print_event,),
+            daemon=True
+        )
+        self.printer_thread.start()
+        
+        # Initial printer detection
+        self.refresh_printer()
+        self.window.mainloop()
+
+    def refresh_printer(self):
+        """Detect printer by scanning COM ports."""
+        com_port = self.detect_printer()
+        if com_port:
+            self.lbl_printer_status.config(text=f"Printer: {com_port} - Connected", fg="green")
+            self.printer_port = com_port
         else:
-            lower = int(count * CHUNK_LINES)  
+            self.lbl_printer_status.config(text="Printer: Not Found", fg="red")
+            self.printer_port = None
 
-        bbox = (left, upper, width, lower)
-        print(left)
-        print(upper)
-        print(width)
-        print(lower)
-        working_slice = img.crop(bbox)
-        upper += CHUNK_LINES
-        #save the slice
-        output.append(working_slice)
-        count +=1
-    return output
+    def detect_printer(self):
+        """Search through COM ports and try to identify the printer."""
+        ports = list(serial.tools.list_ports.comports())
+        for port in ports:
+            try:
+                with ThermalPrinter(port=port.device, heat_time=110) as printer:
+                    return port.device
+            except Exception:
+                continue
+        return None
 
-def repaintImages():
-    global lbl_image_orig
-    global lbl_image_disp
-    global globalSourceImage
-    global globalDisplayImage
+    def handle_clipboard_image(self):
+        """Grabs an image from the clipboard and processes it."""
+        try:
+            img = ImageGrab.grabclipboard()
+            if img is None:
+                messagebox.showerror("Error", "No image in clipboard")
+                return
+            self.source_image = img
+            self.process_image()
+            self.repaint_images()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process clipboard image: {e}")
 
-    if globalSourceImage is None:
-        return  # If no image is loaded, we don't need to repaint or resize anything.
+    def open_image(self):
+        """Opens an image file using a file dialog."""
+        filename = filedialog.askopenfilename()
+        if filename:
+            try:
+                self.source_image = Image.open(filename)
+                self.process_image()
+                self.repaint_images()
+            except Exception as e:
+                messagebox.showerror("Error", f"Cannot open file, check if a valid image was chosen. {e}")
 
-    # Apply brightness and contrast adjustments
-    copyImg = globalSourceImage
-    BriEnhancer = ImageEnhance.Brightness(copyImg)
-    copyImg = BriEnhancer.enhance(1+brightness)
-    CoEnhancer = ImageEnhance.Contrast(copyImg)
-    copyImg = CoEnhancer.enhance(1+contrast)
+    def process_image(self):
+        """Resizes the source image to exactly fill available printer width."""
+        factor = WIDTH_PIXELS / self.source_image.width
+        new_size = (WIDTH_PIXELS, round(self.source_image.height * factor))
+        self.source_image = self.source_image.resize(new_size, RESAMPLE_FILTER)
+        self.display_image = self.source_image
 
-    globalDisplayImage = copyImg.convert('1')
+    def repaint_images(self):
+        """Applies brightness/contrast adjustments and updates the image displays."""
+        if self.source_image is None:
+            return
+        adjusted = self.source_image.copy()
+        adjusted = ImageEnhance.Brightness(adjusted).enhance(1 + self.brightness)
+        adjusted = ImageEnhance.Contrast(adjusted).enhance(1 + self.contrast)
+        self.display_image = adjusted.convert('1')
+        
+        tmp_orig = ImageTk.PhotoImage(self.source_image)
+        self.lbl_image_orig.config(image=tmp_orig)
+        self.lbl_image_orig.image = tmp_orig
+        
+        tmp_disp = ImageTk.PhotoImage(self.display_image)
+        self.lbl_image_disp.config(image=tmp_disp)
+        self.lbl_image_disp.image = tmp_disp
 
-    # Destroy previous labels if they exist
-    try:
-        lbl_image_orig.destroy()
-        lbl_image_disp.destroy()
-    except:
-        pass
+    def on_brightness_change(self, value):
+        try:
+            self.brightness = float(value)
+            self.repaint_images()
+        except ValueError:
+            pass
 
-    # Create new labels for the original and adjusted images
-    tmp_orig = ImageTk.PhotoImage(globalSourceImage)
-    lbl_image_orig = tk.Label(image=tmp_orig)
-    lbl_image_orig.image = tmp_orig  # Keep a reference!
-    lbl_image_orig.place(x=10, y=250)
+    def on_contrast_change(self, value):
+        try:
+            self.contrast = float(value)
+            self.repaint_images()
+        except ValueError:
+            pass
 
-    tmp_disp = ImageTk.PhotoImage(globalDisplayImage)
-    lbl_image_disp = tk.Label(image=tmp_disp)
-    lbl_image_disp.image = tmp_disp  # Keep a reference!
-    lbl_image_disp.place(x=10 + globalSourceImage.width + 10, y=250)  # Adjust placement based on the original image width
+    def rotate_image(self):
+        """Rotates the source image by 90 degrees, then scales it to fill the available width."""
+        if self.source_image is not None:
+            self.source_image = self.source_image.rotate(90, expand=True)
+            self.process_image()
+            self.repaint_images()
 
-    # Dynamically adjust the window size based on image dimensions
-    window_width = globalSourceImage.width * 2 + 30  # Space for both images and some padding
-    window_height = max(globalSourceImage.height, 250) + 250  # Space for controls above and the tallest image
-    window.geometry(f"{window_width}x{window_height}")
+    def slice_and_scale_image(self, img):
+        """Slices the given image into chunks of height CHUNK_LINES."""
+        width, height = img.size
+        slices = []
+        for upper in range(0, height, CHUNK_LINES):
+            lower = min(upper + CHUNK_LINES, height)
+            slice_img = img.crop((0, upper, width, lower))
+            slices.append(slice_img)
+        return slices
 
+    def count_black(self, image):
+        """Counts black pixels in the image."""
+        return sum(1 for pixel in image.getdata() if pixel < 0.0001)
 
-def countBlack (image):
-    blacks = 0
-    for x in range(image.width):
-        for y in range(image.height):
-            if image.getpixel((x,y)) < 0.0001:
-                blacks += 1
-    return blacks
+    def print_thread_function(self, event):
+        """Handles printing in a separate thread."""
+        while True:
+            if event.wait(1):
+                if self.printer_port is None:
+                    print("Printer not connected.")
+                    event.clear()
+                    continue
+                slices = self.slice_and_scale_image(self.display_image)
+                try:
+                    with ThermalPrinter(port=self.printer_port, heat_time=110) as printer:
+                        for slice_img in slices:
+                            if self.print_cancel_flag:
+                                print("Print canceled.")
+                                event.clear()
+                                self.print_cancel_flag = False
+                                printer.feed(2)
+                                break
+                            # Save slice as a temporary BMP file and print using its filename.
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".bmp") as tmp_file:
+                                temp_name = tmp_file.name
+                            slice_img.save(temp_name, format="BMP")
+                            printer.image(temp_name)
+                            os.remove(temp_name)
+                            
+                            ratio = self.count_black(slice_img) / (384 * 20)
+                            ratio = 1.3 * max(0, ratio - 0.5)
+                            time.sleep(ratio)
+                        else:
+                            # Feed extra paper (~1cm) out at the end of printing
+                            printer.feed(40)
+                except Exception as e:
+                    print(f"Printing error: {e}")
+                event.clear()
 
-def printThreadFcn(evt):
-    global print_cancel_flag
-    while True:
-        if evt.wait(1):
-            slices = image_slicer_and_scaler(globalDisplayImage)
-            with ThermalPrinter(port='COM6', heat_time=110) as printer:
-                for slice in slices:
-                    # Check the print cancel flag here.
-                    if print_cancel_flag:
-                        print("Print canceled.")
-                        evt.clear()
-                        print_cancel_flag = False  # Reset the flag for future use.
-                        printer.feed(2)
-                        return  # Exit the thread function to stop printing.
-                    printer.image(slice)
-                    ratio = countBlack(slice) / (384 * 20)
-                    ratio = 1.3 * max(0, ratio - 0.5)
-                    time.sleep(ratio)
-                printer.feed(2)
-            evt.clear()
-
-def cancelPrint():
-    global print_cancel_flag
-    print_cancel_flag = True  # Set the flag to cancel the print operation.
-
-def printImage():
-    global print_event
-    if globalSourceImage == 0:
-        messagebox.showerror("Error", "No image loaded. Load using open image button")
-    else:
-        if print_event.is_set():
+    def print_image(self):
+        """Starts the print operation if an image is loaded."""
+        if self.source_image is None:
+            messagebox.showerror("Error", "No image loaded. Please load an image first.")
+        elif self.print_event.is_set():
             messagebox.showerror("Error", "Another print is running. Please wait until it is completed.")
         else:
-            print_event.set()
+            self.print_event.set()
 
-def incCo():
-    global contrast
-    contrast = contrast + 0.1
-    repaintImages()
+    def cancel_print(self):
+        """Cancels the ongoing print operation."""
+        self.print_cancel_flag = True
 
-def decCo():
-    global contrast
-    contrast = contrast - 0.1
-    repaintImages()
-
-def incBri():
-    global brightness
-    brightness = brightness + 0.1
-    repaintImages()
-
-def decBri():
-    global brightness
-    brightness = brightness - 0.1
-    repaintImages()
-
-def resetCoBri():
-    global brightness
-    global contrast
-    brightness = 0
-    contrast = 0
-    repaintImages()
-
-def openImage():
-    global globalSourceImage
-    global globalDisplayImage
-    imageFileName = filedialog.askopenfilename()
-    try:
-        globalSourceImage = Image.open(imageFileName)
-        process_image()
-    except Exception as e:
-        messagebox.showerror("Error", f"Can not open file, check if valid image was chosen. {e}")
-    repaintImages()
-
-# Make sure to include the call to handle_clipboard_image() in your GUI event loop.
-# For example, bind it to a button or a menu option.
-
-window = tk.Tk()
-window.configure(background="#3e5757")
-window.geometry(str(MIN_WINDOW_WIDTH) + "x400")  # Start with a smaller window that expands as needed
-# Setting the window title
-window.title("Thermal print3r Tool")
-window.iconbitmap('icon.ico')
-
-# Bind Ctrl+V to handle_clipboard_image
-window.bind("<Control-v>", lambda event: handle_clipboard_image())
-
-#lbl_title = tk.Label(text="Thermal Printer Tool", fg="#b9bcba", bg="#3e5757", width=40, height=3, font=("Arial", 25))
-#lbl_title.place(x=0, y=0)
-
-btn_openImage = tk.Button(    text="open image...",    width=13,    height=2,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command=openImage)
-btn_openImage.place(x=10, y=10)
-
-btn_print = tk.Button(    text="print",    width=13,    height=2,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command=printImage)
-btn_print.place(x=130, y=10)
-
-btn_cancelPrint = tk.Button(text="Cancel Print", width=13, height=2, bg="#5c7474", fg="#b9bcba", font=("Arial", 10), command=cancelPrint)
-btn_cancelPrint.place(x=250, y=10)  # Adjust the placement according to your layout.
-
-btn_incCo = tk.Button(    text="+C",    width=5,    height=1,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command = incCo)
-btn_incCo.place(x=10, y=60)
-
-btn_decCo = tk.Button(    text="-C",    width=5,    height=1,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command = decCo)
-btn_decCo.place(x=10, y=95)
-
-btn_incBri = tk.Button(    text="+B",    width=5,    height=1,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command = incBri)
-btn_incBri.place(x=70, y=60)
-
-btn_decBri = tk.Button(    text="-B",    width=5,    height=1,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command = decBri)
-btn_decBri.place(x=70, y=95)
-
-btn_reset = tk.Button(    text="reset",    width=8,    height=2,    bg="#5c7474",    fg="#b9bcba",    font=("Arial", 10), command = resetCoBri)
-btn_reset.place(x=130, y=70)
-
-print_event = threading.Event()
-printerThread = threading.Thread(target=printThreadFcn,args=[print_event], daemon=True).start()
-
-window.mainloop()
-
+if __name__ == "__main__":
+    ThermalPrintTool()
