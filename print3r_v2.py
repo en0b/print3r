@@ -178,12 +178,18 @@ class ThermalPrintTool:
             self.printer_port = None
 
     def detect_printer(self):
-        """Search through COM ports and try to identify the printer."""
+        """Search through COM ports and try to identify the thermal printer.
+        Only returns a COM port if it belongs to the thermal printer.
+        """
+        import serial.tools.list_ports
         ports = list(serial.tools.list_ports.comports())
         for port in ports:
             try:
                 with ThermalPrinter(port=port.device, heat_time=110) as printer:
-                    return port.device
+                    # Hypothetical verification: check that the printer responds correctly.
+                    # Replace 'identify' with the actual method or check provided by ThermalPrinter.
+                    if hasattr(printer, 'identify') and printer.identify() == "ThermalPrinter":
+                        return port.device
             except Exception:
                 continue
         return None
@@ -260,7 +266,7 @@ class ThermalPrintTool:
         """Rotates the source image by 90 degrees, then scales it to fill the available width."""
         if self.source_image is not None:
             self.source_image = self.source_image.rotate(90, expand=True)
-            self.process_image()
+            self.process_image()  # Scales the rotated image to fill the available width.
             self.repaint_images()
 
     def print_thread_function(self, event):
@@ -275,8 +281,8 @@ class ThermalPrintTool:
                     with ThermalPrinter(port=self.printer_port, heat_time=110) as printer:
                         # Print the processed image using the built-in image() method.
                         printer.image(self.display_image)
-                        # Simulate feeding extra paper by printing 10 empty lines.
-                        for _ in range(3):
+                        # Feed extra paper to ensure the whole image is out of the printer.
+                        for _ in range(10):
                             printer.out("")
                 except Exception as e:
                     print(f"Printing error: {e}")
